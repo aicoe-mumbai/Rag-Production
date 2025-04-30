@@ -1,0 +1,8 @@
+logs/
+__pycache__
+**/*\.com*/
+.env
+node_modules/
+.next/
+venv/
+Modern-UI-Chat/universal-sentence-encoder/
