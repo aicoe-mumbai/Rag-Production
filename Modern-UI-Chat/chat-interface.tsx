@@ -114,6 +114,8 @@ export default function ChatInterface() {
   const lastCompletedMessageRef = useRef<HTMLDivElement>(null)
   // Python server status
   const [isPythonServerAvailable, setIsPythonServerAvailable] = useState<boolean>(false)
+  // Track conversation history for context
+  const [conversationHistory, setConversationHistory] = useState<{role: string, content: string}[]>([])
 
   // Constants for layout calculations to account for the padding values
   const HEADER_HEIGHT = 48 // 12px height + padding
@@ -411,6 +413,10 @@ export default function ChatInterface() {
       console.warn("NO DOCUMENT CONTEXT FOUND - AI will respond without document knowledge");
     }
 
+    // Add user message to conversation history
+    const newUserMessage = {role: "user", content: userMessage};
+    setConversationHistory(prev => [...prev.slice(-4), newUserMessage]); // Keep last 4 messages for context
+
     setMessages((prev) => [
       ...prev,
       {
@@ -450,7 +456,70 @@ export default function ChatInterface() {
         
       console.log("Sending to AI model:", contextPrompt.substring(0, 200) + "...");
 
-      // Call AI with relevant chunks
+      // keep track of whether we’ve seen the closing </think> yet
+      let skippingThink = true;
+
+      function filterStreamedChunk(raw: string): string {
+        if (!skippingThink) {
+          // once we’re past the </think>, let everything through
+          return raw;
+        }
+
+        // look for the end tag
+        const endIdx = raw.indexOf('</think>');
+        if (endIdx !== -1) {
+          // drop everything up to and including </think>
+          skippingThink = false;
+          return raw.slice(endIdx + '</think>'.length);
+        }
+
+        // we’re still in the “thought” section → swallow it
+        return '';
+      }
+
+      // Build messages array with system prompt, history, and current message
+      const systemPrompt = {
+        role: "system",
+        content: `You are a technical AI assistant designed to provide accurate, factual, and helpful information. Your primary goal is to assist users with their technical queries while maintaining a professional tone. Here are some guidelines to follow:
+
+        1. **Technical Accuracy**: Focus on providing technically accurate and factual information. Cite sources or references when appropriate.
+        2. **Clarity and Precision**: Keep explanations clear, precise, and to the point. Use technical terminology appropriately.
+        3. **Context Awareness**: Consider the context of the conversation and remember previous questions to provide relevant follow-up responses.
+        4. **Code Quality**: When providing code examples, ensure they follow best practices, are well-commented, and are syntactically correct.
+        5. **Problem-Solving Approach**: Break down complex problems into manageable steps or components.
+        6. **No Personal Information**: Do not ask for or share personal information. Maintain user privacy and confidentiality.
+        7. **Professional Tone**: Maintain a professional and respectful tone in all interactions.
+        8. **Documentation References**: Refer to official documentation or resources when relevant.
+        9. **Stay On Topic**: Keep the conversation relevant to the user's query or topic.
+        10. **Admit Limitations**: If you're unsure about something, acknowledge it rather than providing potentially incorrect information.
+        Don't think on answering
+`
+      };
+
+      // Add document context to the latest user message if available
+      const messagesForAI = [systemPrompt];
+      
+      // Add conversation history if it exists
+      if (conversationHistory.length > 1) {
+        // Add previous conversation history (not including the current message)
+        messagesForAI.push(...conversationHistory.slice(0, -1));
+      }
+      
+      // Add the current user message with document context if available
+      if (relevantContextChunks.length > 0) {
+        messagesForAI.push({
+          role: "user",
+          content: contextPrompt
+        });
+      } else {
+        // Just add the current user message without special context
+        messagesForAI.push({
+          role: "user", 
+          content: userMessage
+        });
+      }
+        
+      // Call AI with relevant chunks and conversation history
       await fetch(TGI_SERVER_URL, {
         method: 'POST',
         headers: {
@@ -458,29 +527,7 @@ export default function ChatInterface() {
         },
         body: JSON.stringify({
           model: "tgi",
-          messages: [
-            {
-              role: "system",
-              content: `You are an AI assistant designed to provide helpful, respectful, and engaging interactions. Your primary goal is to assist users with their queries while maintaining a polite and considerate tone. Here are some guidelines to follow:
-
-1. **Polite Language**: Always use polite and respectful language. Avoid any form of rude, offensive, or disrespectful language.
-2. **Constructive Feedback**: Provide constructive feedback rather than criticism. If a user's input is unclear or inappropriate, guide them gently towards a more appropriate approach.
-3. **Active Listening**: Show empathy and understanding in your responses. Acknowledge the user's feelings and concerns.
-4. **No Harassment**: Do not engage in any form of harassment or bullying. Ensure that all interactions are respectful and considerate.
-5. **Clarity and Conciseness**: Keep your responses clear, concise, and to the point. Avoid unnecessary jargon or complex language.
-6. **No Personal Information**: Do not ask for or share personal information. Maintain user privacy and confidentiality.
-7. **Positive Reinforcement**: Encourage positive behavior and interactions. Reinforce respectful communication by acknowledging and appreciating it.
-8. **No Jokes About Companies or Individuals**: Avoid making jokes or derogatory remarks about any company, individual, country, or war-related topics.
-9. **Stay On Topic**: Keep the conversation relevant to the user's initial query or topic.
-10. **Provide Useful Information**: Ensure that your responses are informative and helpful. Avoid providing misleading or incorrect information.
-
-                  `
-            },
-            {
-              role: "user",
-              content: contextPrompt
-            }
-          ],
+          messages: messagesForAI,
           max_tokens: 1500,
           stream: true,
         }),
@@ -516,6 +563,8 @@ export default function ChatInterface() {
                   if (jsonData.choices && jsonData.choices.length > 0) {
                     const contentChunk = jsonData.choices[0].delta?.content || jsonData.choices[0].message?.content || '';
                     if (contentChunk) {
+                      const clean = filterStreamedChunk(contentChunk);
+                      if (clean) {
                       streamedContent += contentChunk;
                       setStreamingWords((prev) => [
                         ...prev,
@@ -523,7 +572,7 @@ export default function ChatInterface() {
                           id: Date.now() + Math.random(), // Ensure unique ID
                           text: contentChunk,
                         },
-                      ]);
+                      ]); }
                       
                       // Auto-scroll every 5 words to keep up with new content
                       wordCount++;
@@ -556,6 +605,9 @@ export default function ChatInterface() {
           msg.id === messageId ? { ...msg, content: streamedContent, completed: true } : msg
         )
       );
+
+      // Add assistant response to conversation history
+      setConversationHistory(prev => [...prev, { role: "assistant", content: streamedContent }]);
 
       // Add to completed messages set to prevent re-animation
       setCompletedMessages((prev) => new Set(prev).add(messageId))
@@ -1000,6 +1052,8 @@ export default function ChatInterface() {
     console.log("Clearing chat and document context");
     // Clear processed chunks first
     setAllProcessedChunks([]);
+    // Clear conversation history
+    setConversationHistory([]);
     // Then clear messages
     setMessages([]);
     // Clear streaming state if any
@@ -1207,7 +1261,7 @@ export default function ChatInterface() {
                   <div
                     className={cn("p-3 rounded-lg shadow-sm", {
                       "bg-primary text-primary-foreground max-w-[80%]": message.type === "user",
-                      "bg-muted text-black w-[80%]": message.type === "system", // Changed to black text and 80% width
+                      "bg-muted text-foreground w-[80%]": message.type === "system", // Changed from text-black to text-foreground to respect dark mode
                       "w-full bg-muted border border-border": message.type === "file", // File messages styling
                     })}
                   >
