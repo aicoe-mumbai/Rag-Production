@@ -19,7 +19,11 @@ import {
   FileText,
   File,
   Paperclip,
-  X
+  X,
+  History,
+  LogIn,
+  LogOut,
+  User
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -37,8 +41,18 @@ import {
   checkPythonServer
 } from '@/lib/python-api';
 import { ProcessedChunk, FileType, ProcessedDocument } from '@/types/document';
+import { useUser } from '@/components/user-provider';
+import { LoginDialog } from '@/components/login-dialog';
+import { HistorySidebar } from '@/components/history-sidebar';
+import { 
+  saveUserPrompt, 
+  saveAIResponse, 
+  saveFeedback, 
+  getSessionHistory,
+  convertHistoryToMessages
+} from '@/lib/conversation-service';
 
-const TGI_SERVER_URL = process.env.NEXT_PUBLIC_TGI_SERVER_URL || 'http://172.16.34.235:8080/v1/chat/completions ';
+const TGI_SERVER_URL = process.env.NEXT_PUBLIC_TGI_SERVER_URL || '/api/proxy/tgi/v1/chat/completions';
 type ActiveButton = "none" | "think"
 type MessageType = "user" | "system" | "file"
 
@@ -61,6 +75,8 @@ interface Message {
   completed?: boolean
   newSection?: boolean
   fileData?: FileData
+  dbId?: number
+  feedback?: 'up' | 'down'
 }
 
 interface MessageSection {
@@ -116,6 +132,12 @@ export default function ChatInterface() {
   const [isPythonServerAvailable, setIsPythonServerAvailable] = useState<boolean>(false)
   // Track conversation history for context
   const [conversationHistory, setConversationHistory] = useState<{role: string, content: string}[]>([])
+  
+  // User authentication and history state
+  const { userId, username, sessionId, isAuthenticated, logout, createNewSession } = useUser()
+  const [isLoginDialogOpen, setIsLoginDialogOpen] = useState(false)
+  const [isHistorySidebarOpen, setIsHistorySidebarOpen] = useState(false)
+  const [currentPromptDbId, setCurrentPromptDbId] = useState<number | null>(null)
 
   // Constants for layout calculations to account for the padding values
   const HEADER_HEIGHT = 48 // 12px height + padding
@@ -124,7 +146,7 @@ export default function ChatInterface() {
   const BOTTOM_PADDING = 128 // pb-32 (8rem = 128px)
   const ADDITIONAL_OFFSET = 16 // Reduced offset for fine-tuning
 
-  // Check Python server on mount
+  // Check Python server on mount and handle authentication
   useEffect(() => {
     if (!isBrowser) return;
     
@@ -143,7 +165,21 @@ export default function ChatInterface() {
     };
     
     checkServer();
-  }, [toast]);
+    
+    // Check if user is coming from the main app
+    const authToken = localStorage.getItem('authToken');
+    const storedUsername = localStorage.getItem('username');
+    
+    if (authToken && storedUsername && !isAuthenticated) {
+      // User is coming from the main app and not yet authenticated in this app
+      // The user-provider will handle the authentication automatically
+      toast({
+        title: "Welcome",
+        description: `Welcome to the Chat Interface, ${storedUsername}!`,
+        duration: 3000,
+      });
+    }
+  }, [toast, isAuthenticated]);
 
   // Check if device is mobile and get viewport height
   useEffect(() => {
@@ -277,6 +313,53 @@ export default function ChatInterface() {
   const getContentHeight = () => {
     // Calculate available height by subtracting the top and bottom padding from viewport height
     return viewportHeight - TOP_PADDING - BOTTOM_PADDING - ADDITIONAL_OFFSET
+  }
+  
+  // Load conversation history from a session
+  const loadSessionHistory = async (sessionId: string) => {
+    if (!sessionId) return;
+    
+    try {
+      const history = await getSessionHistory(sessionId);
+      if (history.length > 0) {
+        // Convert history entries to messages
+        const historyMessages = convertHistoryToMessages(history);
+        
+        // Clear current messages and set new ones
+        setMessages(historyMessages);
+        
+        // Update conversation history for context
+        const contextHistory = history.flatMap(entry => {
+          const messages = [];
+          if (entry.prompt) {
+            messages.push({ role: 'user', content: entry.prompt });
+          }
+          if (entry.response) {
+            messages.push({ role: 'assistant', content: entry.response });
+          }
+          return messages;
+        });
+        
+        setConversationHistory(contextHistory);
+        
+        toast({
+          title: 'Conversation Loaded',
+          description: `Loaded conversation with ${history.length} messages`,
+        });
+      } else {
+        toast({
+          title: 'Empty Conversation',
+          description: 'No messages found in this conversation',
+        });
+      }
+    } catch (error) {
+      console.error('Error loading session history:', error);
+      toast({
+        title: 'Error',
+        description: 'Failed to load conversation history',
+        variant: 'destructive',
+      });
+    }
   }
 
   // Save the current selection state
@@ -608,6 +691,20 @@ export default function ChatInterface() {
 
       // Add assistant response to conversation history
       setConversationHistory(prev => [...prev, { role: "assistant", content: streamedContent }]);
+      
+      // Save AI response to database if we have a prompt ID
+      if (currentPromptDbId) {
+        try {
+          const success = await saveAIResponse(currentPromptDbId, streamedContent);
+          if (success) {
+            console.log('AI response saved to database successfully');
+          } else {
+            console.error('Failed to save AI response to database');
+          }
+        } catch (error) {
+          console.error('Error saving AI response to database:', error);
+        }
+      }
 
       // Add to completed messages set to prevent re-animation
       setCompletedMessages((prev) => new Set(prev).add(messageId))
@@ -687,6 +784,17 @@ export default function ChatInterface() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (inputValue.trim() && !isStreaming) {
+      // Check if user is authenticated
+      if (!isAuthenticated) {
+        toast({
+          title: 'Login Required',
+          description: 'Please log in to save your conversation history',
+          variant: 'destructive',
+        });
+        setIsLoginDialogOpen(true);
+        return;
+      }
+
       // Add vibration when message is submitted
       // navigator.vibrate(50)
 
@@ -695,8 +803,9 @@ export default function ChatInterface() {
       // Add as a new section if messages already exist
       const shouldAddNewSection = messages.length > 0
 
+      const userMessageId = `user-${Date.now()}`
       const newUserMessage = {
-        id: `user-${Date.now()}`,
+        id: userMessageId,
         content: userMessage,
         type: "user" as MessageType,
         newSection: shouldAddNewSection,
@@ -722,6 +831,28 @@ export default function ChatInterface() {
         if (textareaRef.current) {
           textareaRef.current.blur()
         }
+      }
+
+      // Save user prompt to database
+      if (userId && sessionId) {
+        saveUserPrompt(userId, sessionId, userMessage)
+          .then(promptId => {
+            if (promptId) {
+              setCurrentPromptDbId(promptId);
+              
+              // Update the message with the database ID
+              setMessages(prev => 
+                prev.map(msg => 
+                  msg.id === userMessageId 
+                    ? { ...msg, dbId: promptId } 
+                    : msg
+                )
+              );
+            }
+          })
+          .catch(error => {
+            console.error('Error saving prompt to database:', error);
+          });
       }
 
       // Start AI response
@@ -1039,13 +1170,51 @@ export default function ChatInterface() {
   }
 
   const handleFeedback = (messageId: string, isPositive: boolean) => {
-    // Here you would typically send feedback to your backend
-    console.log(`Feedback for message ${messageId}: ${isPositive ? "positive" : "negative"}`)
+    // Find the message to get its database ID
+    const message = messages.find(msg => msg.id === messageId);
+    if (!message || !message.dbId) {
+      console.error('Cannot save feedback: Message not found or has no database ID');
+      toast({
+        title: "Feedback Error",
+        description: "Could not save your feedback. Please try again.",
+        variant: "destructive",
+      });
+      return;
+    }
 
-    toast({
-      title: "Feedback received",
-      description: `Thank you for your ${isPositive ? "positive" : "negative"} feedback!`,
-    })
+    // Save feedback to the database
+    saveFeedback(message.dbId, isPositive)
+      .then(success => {
+        if (success) {
+          // Update the message in the UI with the feedback
+          setMessages(prev => 
+            prev.map(msg => 
+              msg.id === messageId 
+                ? { ...msg, feedback: isPositive ? 'up' : 'down' } 
+                : msg
+            )
+          );
+
+          toast({
+            title: "Feedback received",
+            description: `Thank you for your ${isPositive ? "positive" : "negative"} feedback!`,
+          });
+        } else {
+          toast({
+            title: "Feedback Error",
+            description: "Could not save your feedback. Please try again.",
+            variant: "destructive",
+          });
+        }
+      })
+      .catch(error => {
+        console.error('Error saving feedback:', error);
+        toast({
+          title: "Feedback Error",
+          description: "Could not save your feedback. Please try again.",
+          variant: "destructive",
+        });
+      });
   }
 
   const refreshPage = () => {
@@ -1205,6 +1374,47 @@ export default function ChatInterface() {
       );
   }
 
+  // Add useEffect to load session history when sessionId changes
+  useEffect(() => {
+    if (sessionId) {
+      loadSessionHistory(sessionId);
+    }
+  }, [sessionId]);
+
+  // Handle new session button click
+  const handleNewSession = async () => {
+    if (!isAuthenticated) {
+      toast({
+        title: 'Login Required',
+        description: 'Please log in to create a new conversation',
+        variant: 'destructive',
+      });
+      setIsLoginDialogOpen(true);
+      return;
+    }
+    
+    try {
+      const newSessionId = await createNewSession();
+      toast({
+        title: 'New Conversation',
+        description: 'Started a new conversation',
+      });
+      
+      // Clear messages and conversation history
+      setMessages([]);
+      setMessageSections([]);
+      setConversationHistory([]);
+      setCurrentPromptDbId(null);
+    } catch (error) {
+      console.error('Error creating new session:', error);
+      toast({
+        title: 'Error',
+        description: 'Failed to create new conversation',
+        variant: 'destructive',
+      });
+    }
+  };
+
   return (
     <div
       ref={mainContainerRef}
@@ -1214,12 +1424,24 @@ export default function ChatInterface() {
         "overflow-hidden", // Prevent body scroll
       )}
     >
+      {/* Login Dialog */}
+      <LoginDialog 
+        isOpen={isLoginDialogOpen} 
+        onClose={() => setIsLoginDialogOpen(false)} 
+      />
+      
+      {/* History Sidebar */}
+      <HistorySidebar 
+        isOpen={isHistorySidebarOpen} 
+        onClose={() => setIsHistorySidebarOpen(false)}
+        onSelectSession={loadSessionHistory}
+      />
+      
       {/* Header */}
       <header className="flex items-center justify-between p-3 border-b border-border sticky top-0 bg-background/80 backdrop-blur-sm z-10 h-12">
-        <div className="flex items-center">
-          {/* Replace with Menu icon */}
-          <Button variant="ghost" size="icon" className="mr-2">
-            <Menu className="h-5 w-5" />
+        <div className="flex items-center space-x-2">
+          <Button variant="ghost" size="icon" onClick={() => setIsHistorySidebarOpen(true)} title="Conversation History">
+            <History className="h-5 w-5" />
           </Button>
           <h1 className="text-lg font-semibold">QwickChat</h1>
         </div>
@@ -1230,10 +1452,31 @@ export default function ChatInterface() {
           ) : (
             <span className="text-xs text-red-500 mr-2">Python Server Inactive</span>
           )}
-          {/* Refresh button */}
-          <Button variant="ghost" size="icon" onClick={refreshPage} title="Clear Chat">
+          
+          {/* User authentication */}
+          {isAuthenticated ? (
+            <div className="flex items-center space-x-2">
+              <span className="text-sm hidden md:inline">{username}</span>
+              <Button variant="ghost" size="icon" onClick={logout} title="Logout">
+                <LogOut className="h-5 w-5" />
+              </Button>
+            </div>
+          ) : (
+            <Button variant="ghost" size="icon" onClick={() => setIsLoginDialogOpen(true)} title="Login">
+              <LogIn className="h-5 w-5" />
+            </Button>
+          )}
+          
+          {/* New conversation button */}
+          <Button variant="ghost" size="icon" onClick={handleNewSession} title="New Conversation">
             <RefreshCw className="h-5 w-5" />
           </Button>
+          
+          {/* Clear chat button */}
+          <Button variant="ghost" size="icon" onClick={refreshPage} title="Clear Chat">
+            <X className="h-5 w-5" />
+          </Button>
+          
           {/* Theme toggle button */}
           <Button variant="ghost" size="icon" onClick={toggleTheme} title="Toggle Theme">
             {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}

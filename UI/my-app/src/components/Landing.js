@@ -11,7 +11,16 @@ function Landing({ username }) {
     if (option === 'qa') {
       navigate('/qa/dashboard');
     } else if (option === 'chat') {
-      window.location.href="http://172.16.34.231:8443/"
+      // Get the authentication token and username from sessionStorage
+      const authToken = sessionStorage.getItem('authToken');
+      const userName = sessionStorage.getItem('userName');
+      
+      // Store them in localStorage so the Modern-UI-Chat app can access them
+      localStorage.setItem('authToken', authToken);
+      localStorage.setItem('username', userName);
+      
+      // Redirect to the Modern-UI-Chat app
+      window.location.href = "http://localhost:8443/";
     }
   };
 

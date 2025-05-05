@@ -1,6 +1,7 @@
 import type React from "react"
 import "./globals.css"
 import { Toaster } from "@/components/ui/toaster"
+import { UserProvider } from "@/components/user-provider"
 
 export default function RootLayout({
   children,
@@ -10,17 +11,17 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className="bg-gray-50 dark:bg-gray-900 overflow-hidden">
-        {children}
-        <Toaster />
+        <UserProvider>
+          {children}
+          <Toaster />
+        </UserProvider>
       </body>
     </html>
   )
 }
 
-
-
-import './globals.css'
-
 export const metadata = {
-      generator: 'v0.dev'
-    };
+  title: 'Modern UI Chat',
+  description: 'A modern chat interface with document processing capabilities',
+  generator: 'v0.dev'
+};

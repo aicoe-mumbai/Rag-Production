@@ -1,9 +1,10 @@
 import { ProcessedChunk } from '@/types/document';
 
-// Use a relative URL that works in both development and container environments
-const API_BASE_URL = typeof window !== 'undefined' 
-  ? `${window.location.protocol}//${window.location.hostname}:8444`
-  : 'http://172.16.34.235:8444';
+// Use our Next.js API proxy to access the Python backend
+// This avoids CORS issues and allows everything to run on a single port
+const API_BASE_URL = typeof window !== 'undefined'
+  ? `${window.location.origin}/api/proxy/python`
+  : process.env.DJANGO_API_URL || 'http://localhost:8000';
 
 /**
  * Process a file using the Python backend
